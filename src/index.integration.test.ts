@@ -419,3 +419,140 @@ describe("Integration: Realistic Scenarios", () => {
         expect(promptCalls.length).toBeGreaterThanOrEqual(0)
     })
 })
+
+describe("Hard Abort: Stuck Prompt Recovery", () => {
+    test("hardAbortAndRetry calls session.abort then prompt", async () => {
+        const { ctx, promptCalls } = createRealisticContext()
+        const hooks = await AutoResumePlugin(ctx, {
+            enabled: true,
+            stuckPromptMs: 50,
+            checkIntervalMs: 20,
+            chunkTimeoutMs: 500_000,
+            gracePeriodMs: 500_000,
+        })
+
+        await hooks.event({
+            event: {
+                type: "session.status",
+                sessionID: "session-1",
+                properties: { status: { type: "busy" } },
+            },
+        })
+
+        await new Promise((resolve) => setTimeout(resolve, 3000))
+
+        expect(ctx.client.session.abort).toHaveBeenCalled()
+        expect(promptCalls.length).toBeGreaterThanOrEqual(1)
+        expect(promptCalls.some((c) => c.body === "continue")).toBe(true)
+    })
+
+    test("hard abort does not fire if session receives events within window", async () => {
+        const { ctx, promptCalls } = createRealisticContext()
+        const hooks = await AutoResumePlugin(ctx, {
+            enabled: true,
+            stuckPromptMs: 5_000,
+            checkIntervalMs: 100,
+            chunkTimeoutMs: 500_000,
+            gracePeriodMs: 500_000,
+        })
+
+        await hooks.event({
+            event: {
+                type: "session.status",
+                sessionID: "session-1",
+                properties: { status: { type: "busy" } },
+            },
+        })
+
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        await hooks.event({
+            event: {
+                type: "message.part.updated",
+                sessionID: "session-1",
+                properties: {
+                    part: { type: "text", text: "still streaming" },
+                },
+            },
+        })
+
+        await new Promise((resolve) => setTimeout(resolve, 50))
+
+        expect(ctx.client.session.abort).not.toHaveBeenCalled()
+        expect(promptCalls.length).toBe(0)
+    })
+
+    test("hard abort proceeds even when session.abort throws", async () => {
+        const ctx = createRealisticContext()
+        ctx.ctx.client.session.abort = mock(async () => {
+            throw new Error("abort network failure")
+        })
+        const hooks = await AutoResumePlugin(ctx.ctx, {
+            enabled: true,
+            stuckPromptMs: 50,
+            checkIntervalMs: 20,
+            chunkTimeoutMs: 500_000,
+            gracePeriodMs: 500_000,
+        })
+
+        await hooks.event({
+            event: {
+                type: "session.status",
+                sessionID: "session-1",
+                properties: { status: { type: "busy" } },
+            },
+        })
+
+        await new Promise((resolve) => setTimeout(resolve, 3000))
+
+        expect(ctx.ctx.client.session.abort).toHaveBeenCalled()
+        expect(ctx.promptCalls.length).toBeGreaterThanOrEqual(1)
+    })
+
+    test("hard abort respects aborting guard", async () => {
+        const { ctx, promptCalls } = createRealisticContext()
+        const hooks = await AutoResumePlugin(ctx, {
+            enabled: true,
+            stuckPromptMs: 50,
+            checkIntervalMs: 20,
+            chunkTimeoutMs: 500_000,
+            gracePeriodMs: 500_000,
+        })
+
+        await hooks.event({
+            event: {
+                type: "session.status",
+                sessionID: "session-1",
+                properties: { status: { type: "busy" } },
+            },
+        })
+
+        await new Promise((resolve) => setTimeout(resolve, 3000))
+
+        const abortCallCount = ctx.client.session.abort.mock.calls.length
+        expect(abortCallCount).toBeGreaterThanOrEqual(1)
+        expect(promptCalls.length).toBeGreaterThanOrEqual(1)
+    })
+
+    test("stuckPromptMs option is configurable", async () => {
+        const { ctx } = createRealisticContext()
+        const hooks = await AutoResumePlugin(ctx, {
+            enabled: true,
+            stuckPromptMs: 120_000,
+            checkIntervalMs: 10,
+            chunkTimeoutMs: 500_000,
+            gracePeriodMs: 500_000,
+        })
+
+        await hooks.event({
+            event: {
+                type: "session.status",
+                sessionID: "session-1",
+                properties: { status: { type: "busy" } },
+            },
+        })
+
+        await new Promise((resolve) => setTimeout(resolve, 50))
+
+        expect(ctx.client.session.abort).not.toHaveBeenCalled()
+    })
+})

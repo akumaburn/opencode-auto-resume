@@ -8,6 +8,8 @@ LLM sessions fail in predictable ways. This plugin monitors all sessions and aut
 
 **Stall recovery** — the stream goes silent but the session stays "busy". The UI shows a blinking cursor with no progress. If no events arrive for 48 seconds, the plugin sends `"continue"` with exponential backoff starting at 30s, doubling each retry, capped at 10 minutes. Retries continue indefinitely — the plugin never gives up on a stalled session. Actively-running tool calls that produce output are never interrupted (any event resets the timer).
 
+**Hard abort recovery** — when the LLM connection itself hangs (no SSE data at all, TCP half-open), the plugin detects that no bus events have arrived for 60 seconds and force-aborts the connection. The abort call is given a 3-second deadline via `Promise.race` — if the HTTP abort doesn't resolve (the socket is truly stuck at the kernel level), the plugin proceeds anyway. It then force-sets the session to idle locally and sends `"continue"`. This works because opencode's `Runner.cancel()` transitions the Effect state machine from `Running` to `Idle` via `Fiber.interrupt`, which allows the queued continue prompt to be accepted by `ensureRunning()`. The old hung fiber is orphaned and eventually GC'd.
+
 The plugin extracts the **agent, model, and provider** from the last session message, so it resumes with the exact same configuration the user was using (build, sisyphus, prometheus, etc.).
 _( [#55](https://github.com/anomalyco/opencode/issues/55), [#199](https://github.com/anomalyco/opencode/issues/199), [#283](https://github.com/anomalyco/opencode/issues/283) )_
 
@@ -63,6 +65,10 @@ Timer loop (every 5s):
     ├─ orphan watch active? → wait or abort+continue (continuous retry w/ backoff)
     ├─ busyCount > 1?
     │   └─ idle > 4x timeout? → check subagents, recover or resume (continuous retry)
+    ├─ no events for stuckPromptMs (60s)? → HARD ABORT
+    │   ├─ session.abort with 3s deadline (Promise.race)
+    │   ├─ force-set status to idle (regardless of abort result)
+    │   └─ send "continue" (1.5s delay)
     └─ idle > 48s? → hallucination loop? abort : continue with backoff
         └─ continuous retry: 30s → 60s → 120s → 240s → 480s → 600s (cap)
 
@@ -94,6 +100,7 @@ With options:
   "plugin": [
     ["opencode-auto-resume", {
       "chunkTimeoutMs": 45000,
+      "stuckPromptMs": 60000,
       "gracePeriodMs": 3000,
       "maxRetries": 3
     }]
@@ -121,7 +128,7 @@ bun run build
   "plugin": [
     [
       "file:///home/YOURUSER/.config/opencode/plugins/opencode-auto-resume/dist/index.js",
-      { "chunkTimeoutMs": 45000, "maxRetries": 3 }
+      { "chunkTimeoutMs": 45000, "stuckPromptMs": 60000, "maxRetries": 3 }
     ]
   ]
 }
@@ -130,6 +137,7 @@ bun run build
 | Option | Default | Description |
 |---|---|---|
 | `chunkTimeoutMs` | `45000` | Inactivity timeout before considering stream stalled |
+| `stuckPromptMs` | `60000` | No-data timeout before hard-aborting the connection (last resort) |
 | `gracePeriodMs` | `3000` | Extra wait before acting (lets ESC/status events arrive) |
 | `checkIntervalMs` | `5000` | Timer poll interval |
 | `maxRetries` | `3` | Max tool-call-as-text recovery attempts (stall recovery is unlimited) |
@@ -160,3 +168,4 @@ The plugin handles all recovery automatically — no manual intervention needed.
 | Hallucination loop not caught | Decrease `loopMaxContinues` to `2` |
 | Tool-text not detected | Check server logs — requires SDK message fetching |
 | Agent stalls after tool call ends | Expected to auto-recover with continuous retry (30s initial backoff) |
+| Connection hangs completely (no data) | Hard abort triggers after 60s — decrease `stuckPromptMs` if too slow |

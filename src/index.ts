@@ -20,6 +20,7 @@ interface Todo {
 
 interface SessionWatch {
     lastActivityAt: number
+    lastEventAt: number
     status: "busy" | "idle" | "retry" | "unknown"
     userCancelled: boolean
     resumeAttempts: number
@@ -35,6 +36,7 @@ interface SessionWatch {
     todoCheckAttempts: number
     toolRunningSince: number | null
     lastToolOutputAt: number | null
+    stuckAborts: number
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +53,9 @@ const DEFAULT_SUBAGENT_WAIT_MS = 15_000
 const ABORT_CONTINUE_DELAY_MS = 2_000
 const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
+const DEFAULT_STUCK_PROMPT_MS = 60_000
+const STUCK_ABORT_TIMEOUT_MS = 3_000
+const STUCK_CONTINUE_DELAY_MS = 1_500
 
 /** Delay after session goes idle before checking for tool-call-as-text. */
 const TOOL_TEXT_CHECK_DELAY_MS = 1_500
@@ -172,6 +177,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     (options?.loopMaxContinues as number) ?? DEFAULT_LOOP_MAX_CONTINUES
     const loopWindowMs: number =
     (options?.loopWindowMs as number) ?? DEFAULT_LOOP_WINDOW_MS
+    const stuckPromptMs: number =
+    (options?.stuckPromptMs as number) ?? DEFAULT_STUCK_PROMPT_MS
 
     const sessions = new Map<string, SessionWatch>()
     let timer: ReturnType<typeof setInterval> | null = null
@@ -223,6 +230,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (!w) {
             w = {
                 lastActivityAt: Date.now(),
+                lastEventAt: Date.now(),
                 status: "unknown",
                 userCancelled: false,
                 resumeAttempts: 0,
@@ -238,6 +246,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 todoCheckAttempts: 0,
                 toolRunningSince: null,
                 lastToolOutputAt: null,
+                stuckAborts: 0,
             }
             sessions.set(sid, w)
         }
@@ -251,7 +260,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         const w = sessions.get(sid)
         if (w && w.status === "busy" && !w.userCancelled) {
             w.lastActivityAt = Date.now()
-            // Don't reset resumeAttempts here — only reset on new busy status
+            w.lastEventAt = Date.now()
         }
     }
 
@@ -525,6 +534,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.continuing = false
         w.toolRunningSince = null
         w.lastToolOutputAt = null
+        w.stuckAborts = 0
     }
 
     function resetIdleFlags(w: SessionWatch) {
@@ -716,6 +726,58 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     }
 
     // -----------------------------------------------------------------------
+    // Hard Abort: stuck prompt (no data on connection for stuckPromptMs)
+    // -----------------------------------------------------------------------
+
+    async function hardAbortAndRetry(sid: string, w: SessionWatch): Promise<boolean> {
+        if (typeof sid !== "string" || !sid) return false
+        if (w.aborting || w.continuing) return false
+        w.aborting = true
+
+        const stuckSec = Math.round((Date.now() - w.lastEventAt) / 1000)
+        await log(
+            "warn",
+            `HARD ABORT on ${short(sid)} (${stuckSec}s with no data, stuck abort #${w.stuckAborts + 1}). ` +
+            `Force-aborting connection...`,
+        )
+
+        let abortOk = false
+        try {
+            const abortPromise = ctx.client.session.abort({ sessionID: sid })
+            const timeoutPromise = new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error("abort timed out")), STUCK_ABORT_TIMEOUT_MS),
+            )
+            await Promise.race([abortPromise, timeoutPromise])
+            abortOk = true
+            await log("info", `${short(sid)} - hard abort OK`)
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("warn", `${short(sid)} - hard abort did not resolve cleanly: ${errMsg} (proceeding anyway)`)
+        }
+
+        if (w.status === "busy") w.status = "idle"
+
+        await new Promise<void>((resolve) => setTimeout(resolve, STUCK_CONTINUE_DELAY_MS))
+
+        try {
+            await sendContinuePrompt(sid, "continue", w)
+            await log("info", `${short(sid)} - hard abort+continue done`)
+            w.stuckAborts++
+            w.lastRetryAt = Date.now()
+            w.lastActivityAt = Date.now()
+            w.lastEventAt = Date.now()
+            w.aborting = false
+            return true
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("warn", `${short(sid)} - continue after hard abort failed: ${errMsg}`)
+            w.lastRetryAt = Date.now()
+            w.aborting = false
+            return abortOk
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Resume: normal stall
     // -----------------------------------------------------------------------
 
@@ -768,7 +830,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     if (status) {
                         const w = sessions.get(sid)!
                         w.status = status as SessionWatch["status"]
-                        if (status === "idle") w.idleSince = Date.now()
+                        if (status === "idle") {
+                            w.idleSince = Date.now()
+                        } else if (status === "busy") {
+                            w.lastEventAt = Date.now()
+                        }
                     }
                     if (isNew) {
                         log("debug", `Discovered session ${short(sid)} via list()`)
@@ -868,6 +934,16 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 }
 
                 const idle = now - w.lastActivityAt
+                const noDataMs = now - w.lastEventAt
+                if (noDataMs >= stuckPromptMs) {
+                    await log(
+                        "info",
+                        `Stuck prompt detected on ${short(sid)}: ${Math.round(noDataMs / 1000)}s with no events. Triggering hard abort.`,
+                    )
+                    await hardAbortAndRetry(sid, w)
+                    continue
+                }
+
                 if (idle >= chunkTimeoutMs + gracePeriodMs) {
                     tryResume(sid, w, "Stream stall")
                 }
@@ -913,6 +989,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                 if (statusType === "busy") {
                     w.lastActivityAt = Date.now()
+                    w.lastEventAt = Date.now()
                     resetSessionFlags(w)
                     log("debug", `${short(sid)} -> busy (${busyCount()})`)
                 } else if (statusType === "idle") {
@@ -1059,7 +1136,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         event: async ({ event }) => {
             if (!initialised) {
                 initialised = true
-                log("info", `opencode-auto-resume ready. timeout=${chunkTimeoutMs / 1000}s, backoff=${baseBackoffMs / 1000}s-${maxBackoffMs / 1000}s, continuous retry, orphan=${subagentWaitMs / 1000}s, loop=${loopMaxContinues}x/${loopWindowMs / 1000}s`)
+                log("info", `opencode-auto-resume ready. timeout=${chunkTimeoutMs / 1000}s, stuck=${stuckPromptMs / 1000}s, backoff=${baseBackoffMs / 1000}s-${maxBackoffMs / 1000}s, continuous retry, orphan=${subagentWaitMs / 1000}s, loop=${loopMaxContinues}x/${loopWindowMs / 1000}s`)
             }
             handleEvent(event as Record<string, unknown>)
         },
